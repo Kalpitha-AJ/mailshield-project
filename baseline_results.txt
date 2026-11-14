@@ -1,0 +1,27 @@
+MAILSHIELD: BASELINE MODEL EVALUATION
+
+Model: TF-IDF + Calibrated Linear SVM
+
+Dataset:
+- Training emails: 12,265
+- Validation emails: 2,628
+- Testing emails: 2,629
+
+Test Performance:
+- Accuracy: 98.48%
+- ROC-AUC: 0.9979
+- False Positives: 18
+- False Negatives: 22
+- Correct predictions: 2,589
+
+Custom Email Testing:
+- Customer support: 91.30% phishing probability
+- Order confirmation: 71.10%
+- Appointment confirmation: 50.52%
+- College timetable: 76.43%
+
+Observation:
+The model performs well on the original test dataset but demonstrates false positives on manually written legitimate emails.
+
+Conclusion:
+Further evaluation using diverse, modern email datasets is necessary to improve generalisation.

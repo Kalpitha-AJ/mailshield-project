@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+models/modernbert/
+models/modernbert.zip
+data/
+.ipynb_checkpoints/
