@@ -5,3 +5,4 @@ models/modernbert/
 models/modernbert.zip
 data/
 .ipynb_checkpoints/
+.streamlit/secrets.toml
