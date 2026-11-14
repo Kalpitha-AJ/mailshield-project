@@ -1,23 +1,16 @@
-import re
-import io
 import csv
-from datetime import datetime, timezone
+import io
+import re
 
 import joblib
+import numpy as np
 import streamlit as st
-import torch
 from supabase import create_client
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # -------------------- PAGE CONFIG --------------------
-st.set_page_config(
-    page_title="MailShield | AI Email Security",
-    page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="MailShield | AI Email Security", page_icon="🛡️",
+                   layout="wide", initial_sidebar_state="expanded")
 
-# -------------------- STYLE --------------------
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
@@ -36,59 +29,91 @@ h1,h2,h3 {font-family:'Space Grotesk',sans-serif!important;color:#edf6ff!importa
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------- SUPABASE --------------------
-@st.cache_resource
-def get_supabase():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
+# -------------------- RISK LOGIC (single source of truth) --------------------
+# Survey Table III: p < 0.30 Low / Legitimate, 0.30-0.70 Medium / Suspicious, >= 0.70 High / Phishing.
+# Both the label and the risk level come from the SAME probability, so they can never disagree.
+LOW_CUTOFF, HIGH_CUTOFF = 30.0, 70.0
+
+
+def classify(probability):
+    """probability is a percentage (0-100). Returns (label, risk_level)."""
+    if probability < LOW_CUTOFF:
+        return "LEGITIMATE", "LOW"
+    if probability < HIGH_CUTOFF:
+        return "SUSPICIOUS", "MEDIUM"
+    return "PHISHING", "HIGH"
+
+
+# MUST stay identical to clean() in train_lr.py
+URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+
+
+def clean(text):
+    return URL_RE.sub(" urltoken ", str(text).lower())
+
+
+# -------------------- SUPABASE / LOGIN --------------------
+def get_client():
+    """One client PER USER SESSION. (A cached global client is shared by everyone and mixes up logins.)"""
+    if "sb_client" not in st.session_state:
+        st.session_state["sb_client"] = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+    return st.session_state["sb_client"]
+
+
+def friendly_error(e):
+    msg = str(e).lower()
+    if "invalid login" in msg or "invalid credentials" in msg:
+        return "Wrong email or password."
+    if "not confirmed" in msg:
+        return "Please confirm your email first (check your inbox and spam folder), then log in."
+    if "rate limit" in msg or "too many" in msg:
+        return "Too many attempts. Wait a minute and try again."
+    if "network" in msg or "connection" in msg or "timed out" in msg:
+        return "Could not reach the server. Check your internet and try again."
+    return f"Something went wrong: {e}"
+
+
+def start_session(result):
+    st.session_state["logged_in"] = True
+    st.session_state["user_id"] = result.user.id
+    st.session_state["user_email"] = result.user.email
+    try:  # make sure database calls are sent as this user
+        get_client().postgrest.auth(result.session.access_token)
+    except Exception:
+        pass
+
 
 def logout():
-    for k in ["access_token", "refresh_token", "user_id", "user_email"]:
-        st.session_state.pop(k, None)
+    try:
+        get_client().auth.sign_out()
+    except Exception:
+        pass
+    st.session_state.clear()
     st.rerun()
 
-def current_client():
-    client = get_supabase()
-    if st.session_state.get("access_token") and st.session_state.get("refresh_token"):
-        try:
-            response = client.auth.set_session(
-                st.session_state["access_token"],
-                st.session_state["refresh_token"]
-            )
-            if getattr(response, "session", None):
-                st.session_state["access_token"] = response.session.access_token
-                st.session_state["refresh_token"] = response.session.refresh_token
-            user = client.auth.get_user()
-            if user and user.user:
-                st.session_state["user_id"] = user.user.id
-                st.session_state["user_email"] = user.user.email
-                return client
-        except Exception:
-            pass
-    return None
 
 def auth_screen():
     st.markdown('<div class="hero"><div class="eyebrow">AI EMAIL SECURITY PLATFORM</div><h1>🛡️ MailShield</h1><p>Detect suspicious emails. Understand risk. Keep your analysis organised.</p></div>', unsafe_allow_html=True)
     left, right = st.columns([1.15, 1])
     with left:
         st.markdown("### Your email security workspace")
-        st.markdown("- AI-powered phishing classification\n- ModernBERT and SVM detection engines\n- Private analysis history\n- Search, edit, archive and export reports")
+        st.markdown("- Phishing detection with Low / Medium / High risk\n- Logistic Regression, ModernBERT and SVM engines\n- Explainable red flags\n- Private analysis history with search, archive and export")
     with right:
         tab1, tab2 = st.tabs(["Login", "Create account"])
         with tab1:
             email = st.text_input("Email address", key="login_email")
             password = st.text_input("Password", type="password", key="login_password")
             if st.button("Login", use_container_width=True):
-                try:
-                    result = get_supabase().auth.sign_in_with_password({"email": email.strip(), "password": password})
-                    st.session_state["access_token"] = result.session.access_token
-                    st.session_state["refresh_token"] = result.session.refresh_token
-                    st.session_state["user_id"] = result.user.id
-                    st.session_state["user_email"] = result.user.email
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Login failed: {e}")
+                if not email.strip() or not password:
+                    st.warning("Enter your email and password.")
+                else:
+                    try:
+                        result = get_client().auth.sign_in_with_password(
+                            {"email": email.strip(), "password": password})
+                        start_session(result)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(friendly_error(e))
         with tab2:
             new_email = st.text_input("Email address", key="signup_email")
             new_password = st.text_input("Create password", type="password", key="signup_password")
@@ -102,75 +127,119 @@ def auth_screen():
                     st.warning("Use a password with at least 6 characters.")
                 else:
                     try:
-                        result = get_supabase().auth.sign_up({"email": new_email.strip(), "password": new_password})
-                        if result.session:
-                            st.session_state["access_token"] = result.session.access_token
-                            st.session_state["refresh_token"] = result.session.refresh_token
-                            st.session_state["user_id"] = result.user.id
-                            st.session_state["user_email"] = result.user.email
+                        result = get_client().auth.sign_up({"email": new_email.strip(), "password": new_password})
+                        if result.user is not None and not getattr(result.user, "identities", None):
+                            st.warning("This email is already registered. Please log in instead.")
+                        elif result.session:
+                            start_session(result)
                             st.rerun()
                         else:
                             st.success("Account created. Check your email to confirm it, then log in.")
                     except Exception as e:
-                        st.error(f"Sign-up failed: {e}")
+                        st.error(friendly_error(e))
+
 
 if not st.secrets.get("SUPABASE_URL") or not st.secrets.get("SUPABASE_KEY"):
     st.error("Supabase settings are missing. Add SUPABASE_URL and SUPABASE_KEY in Streamlit Secrets.")
     st.stop()
 
-if not st.session_state.get("access_token"):
+if not st.session_state.get("logged_in"):
     auth_screen()
     st.stop()
 
-supabase = current_client()
-if supabase is None:
+supabase = get_client()
+try:
+    _session = supabase.auth.get_session()  # refreshes the token automatically when needed
+except Exception:
+    _session = None
+if _session is None:
+    st.session_state.clear()
     st.warning("Your session expired. Please log in again.")
-    logout()
+    st.rerun()
+try:
+    supabase.postgrest.auth(_session.access_token)
+except Exception:
+    pass
 
 uid = st.session_state["user_id"]
 
-# -------------------- MODEL FUNCTIONS --------------------
+
+# -------------------- MODELS --------------------
+@st.cache_resource
+def load_lr():
+    return joblib.load("models/lr.joblib")
+
+
 @st.cache_resource
 def load_svm():
     return joblib.load("models/svm.joblib")
 
+
 @st.cache_resource
 def load_modernbert():
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer  # imported lazily: faster start
     name = "kalpithaaj/mailshield-modernbert"
     tokenizer = AutoTokenizer.from_pretrained(name)
     model = AutoModelForSequenceClassification.from_pretrained(name)
     model.eval()
     return tokenizer, model
 
-def predict_svm(email_text):
+
+def predict_lr(text):
+    """Calibrated LR probability (%) and the words pushing the email towards phishing."""
+    bundle = load_lr()
+    x = bundle["vectorizer"].transform([clean(text)])
+    probability = float(bundle["calibrated"].predict_proba(x)[0, 1]) * 100
+    coef = bundle["lr"].coef_[0]
+    names = bundle["vectorizer"].get_feature_names_out()
+    contrib = x.multiply(coef).tocoo()
+    top = sorted(zip(contrib.col, contrib.data), key=lambda t: -t[1])[:6]
+    # exp(w) = how many times a word multiplies the odds of phishing (survey Section IV-F)
+    flags = [(names[c], float(np.exp(coef[c]))) for c, v in top if v > 0]
+    return probability, flags
+
+
+def predict_svm(text):
     model = load_svm()
-    pred = int(model.predict([email_text])[0])
-    probs = model.predict_proba([email_text])[0]
-    return pred, float(probs[1]) * 100
+    probs = model.predict_proba([text])[0]
+    classes = list(model.classes_)
+    idx = classes.index(1) if 1 in classes else 1
+    return float(probs[idx]) * 100, []
 
-def predict_modernbert(email_text):
+
+def predict_modernbert(text):
+    import torch
     tokenizer, model = load_modernbert()
-    inputs = tokenizer(email_text, return_tensors="pt", truncation=True, max_length=512)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
     with torch.no_grad():
-        outputs = model(**inputs)
-        probs = torch.softmax(outputs.logits, dim=1)[0]
-    return int(torch.argmax(probs)), float(probs[1].item()) * 100
+        probs = torch.softmax(model(**inputs).logits, dim=1)[0]
+    # find the phishing class from the model config instead of assuming index 1
+    idx = 1
+    for i, label in model.config.id2label.items():
+        if any(k in str(label).lower() for k in ("phish", "spam", "malicious", "unsafe")):
+            idx = int(i)
+            break
+    return float(probs[idx].item()) * 100, []
 
-def indicators(email_text):
+
+def indicators(text):
     patterns = {
-        "Suspicious links": r"https?://|www\.",
+        "Contains links": r"https?://|www\.",
         "Urgent language": r"\b(urgent|immediately|suspended|expire|act now)\b",
         "Password requests": r"\b(password|login|credentials|verify account)\b",
         "Payment requests": r"\b(payment|bank details|credit card|transfer money)\b",
         "Sensitive information requests": r"\b(otp|pin|social security|personal information)\b",
     }
-    return [label for label, pattern in patterns.items() if re.search(pattern, email_text, re.I)]
+    return [label for label, pattern in patterns.items() if re.search(pattern, text, re.I)]
+
+
+PREDICTORS = {"Logistic Regression": predict_lr, "ModernBERT": predict_modernbert, "SVM": predict_svm}
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
     st.markdown('<div class="brand">🛡️ MailShield</div>', unsafe_allow_html=True)
     st.caption("AI-powered email security")
-    st.write(f"Signed in as **{st.session_state.get('user_email','')}**")
+    st.write(f"Signed in as **{st.session_state.get('user_email', '')}**")
     page = st.radio("WORKSPACE", ["Overview", "Email Scanner", "Analysis History", "Settings"])
     st.divider()
     if st.button("Log out", use_container_width=True):
@@ -178,20 +247,23 @@ with st.sidebar:
 
 st.markdown('<div class="hero"><div class="eyebrow">EMAIL THREAT INTELLIGENCE</div><h1>MailShield Security Workspace</h1><p>Analyse email content, assess phishing risk and manage your private reports.</p></div>', unsafe_allow_html=True)
 
+
 def fetch_history(archived=None):
     q = supabase.table("analysis_history").select("*").eq("user_id", uid).order("created_at", desc=True)
     if archived is not None:
         q = q.eq("is_archived", archived)
     return q.execute().data or []
 
+
+# -------------------- PAGES --------------------
 if page == "Overview":
     try:
         rows = fetch_history()
         total = len(rows)
         threats = sum(1 for r in rows if r.get("prediction") == "PHISHING")
         archived = len(fetch_history(True))
-        a,b,c = st.columns(3)
-        for col, label, value in [(a,"TOTAL ANALYSES",total),(b,"PHISHING DETECTED",threats),(c,"ARCHIVED REPORTS",archived)]:
+        a, b, c = st.columns(3)
+        for col, label, value in [(a, "TOTAL ANALYSES", total), (b, "PHISHING DETECTED", threats), (c, "ARCHIVED REPORTS", archived)]:
             with col:
                 st.markdown(f'<div class="panel"><div class="eyebrow">{label}</div><div class="metric-value">{value}</div></div>', unsafe_allow_html=True)
         st.subheader("Recent activity")
@@ -202,40 +274,52 @@ if page == "Overview":
 
 elif page == "Email Scanner":
     st.subheader("📩 Analyse an email")
-    model_choice = st.radio("Detection model", ["ModernBERT", "SVM"], horizontal=True)
-    email_text = st.text_area("Paste email content", height=230, placeholder="Paste the email you want MailShield to analyse...")
+    model_choice = st.radio("Detection model", list(PREDICTORS), horizontal=True)
+    email_text = st.text_area("Paste email content", height=230,
+                              placeholder="Paste the email you want MailShield to analyse...")
     if st.button("Analyse email", type="primary", use_container_width=True):
         if not email_text.strip():
             st.warning("Paste an email first.")
         else:
             with st.spinner(f"Analysing with {model_choice}..."):
                 try:
-                    pred, probability = predict_modernbert(email_text) if model_choice == "ModernBERT" else predict_svm(email_text)
-                    found = indicators(email_text)
-                    label = "PHISHING" if pred == 1 else "SAFE"
-                    risk = "HIGH" if probability >= 70 else "MEDIUM" if probability >= 40 else "LOW"
+                    probability, flags = PREDICTORS[model_choice](email_text)
+                    label, risk = classify(probability)
                     st.session_state["latest_analysis"] = {
-                        "email_text": email_text, "prediction": label, "probability": round(probability,2),
-                        "risk_level": risk, "model_used": model_choice, "indicators": found
+                        "email_text": email_text, "prediction": label, "probability": round(probability, 2),
+                        "risk_level": risk, "model_used": model_choice,
+                        "indicators": indicators(email_text), "flags": flags,
                     }
+                except FileNotFoundError:
+                    st.error("Model file not found. Make sure models/lr.joblib (and svm.joblib) are in your repo.")
                 except Exception as e:
                     st.error(f"Analysis failed: {e}")
+
     result = st.session_state.get("latest_analysis")
     if result:
         st.divider()
         st.subheader("📊 Analysis results")
-        x,y,z = st.columns(3)
+        x, y, z = st.columns(3)
         x.metric("Detection result", result["prediction"])
         y.metric("Phishing probability", f'{result["probability"]:.2f}%')
         z.metric("Risk level", result["risk_level"])
-        st.progress(min(max(result["probability"]/100,0),1))
-        st.markdown("#### Suspicious indicators")
+        st.progress(min(max(result["probability"] / 100, 0), 1))
+        st.caption(f"Bands: below {LOW_CUTOFF:.0f}% Low (Legitimate), {LOW_CUTOFF:.0f}-{HIGH_CUTOFF:.0f}% Medium (Suspicious), "
+                   f"{HIGH_CUTOFF:.0f}% and above High (Phishing).")
+
+        if result["flags"]:
+            st.markdown("#### Why the model flagged this (top words)")
+            for word, mult in result["flags"]:
+                st.warning(f'**{word}**: multiplies the odds of phishing by about ×{mult:.1f}')
+
+        st.markdown("#### Basic indicators found in the text")
         if result["indicators"]:
             for item in result["indicators"]:
-                st.warning(item)
+                st.info(item)
         else:
-            st.success("No basic suspicious indicators found.")
+            st.success("No basic indicators found.")
         st.caption(f'Model: {result["model_used"]}. Predictions are not a guarantee of email safety.')
+
         with st.form("save_analysis_form"):
             title = st.text_input("Report title", value=f'{result["prediction"].title()} email analysis')
             notes = st.text_area("Notes (optional)")
@@ -247,7 +331,7 @@ elif page == "Email Scanner":
                     "email_preview": result["email_text"][:240],
                     "prediction": result["prediction"], "probability": result["probability"],
                     "risk_level": result["risk_level"], "model_used": result["model_used"],
-                    "indicators": result["indicators"], "notes": notes, "is_archived": False
+                    "indicators": result["indicators"], "notes": notes, "is_archived": False,
                 }).execute()
                 st.success("Analysis saved to your private history.")
             except Exception as e:
@@ -261,32 +345,35 @@ elif page == "Analysis History":
         rows = fetch_history(view == "Archived")
         if search.strip():
             term = search.casefold()
-            rows = [r for r in rows if term in " ".join(str(r.get(k,"")) for k in ["title","prediction","model_used","notes","email_preview"]).casefold()]
+            rows = [r for r in rows if term in " ".join(
+                str(r.get(k, "")) for k in ["title", "prediction", "model_used", "notes", "email_preview"]).casefold()]
         st.caption(f"{len(rows)} report(s)")
         for row in rows:
             with st.expander(f'{row.get("title") or "Untitled"} · {row.get("prediction")} · {row.get("risk_level")}'):
-                st.write(f'**Date:** {row.get("created_at","")}')
-                st.write(f'**Model:** {row.get("model_used","")}')
-                st.write(f'**Phishing probability:** {row.get("probability","")}%')
+                st.write(f'**Date:** {row.get("created_at", "")}')
+                st.write(f'**Model:** {row.get("model_used", "")}')
+                st.write(f'**Phishing probability:** {row.get("probability", "")}%')
                 st.write("**Email preview:**")
-                st.write(row.get("email_preview",""))
+                st.write(row.get("email_preview", ""))
                 with st.form(f'edit_{row["id"]}'):
                     new_title = st.text_input("Title", value=row.get("title") or "")
                     new_notes = st.text_area("Notes", value=row.get("notes") or "")
                     save_edit = st.form_submit_button("Save changes")
                 if save_edit:
                     try:
-                        supabase.table("analysis_history").update({"title":new_title,"notes":new_notes}).eq("id",row["id"]).eq("user_id",uid).execute()
+                        supabase.table("analysis_history").update({"title": new_title, "notes": new_notes}) \
+                            .eq("id", row["id"]).eq("user_id", uid).execute()
                         st.success("Report updated.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Update failed: {e}")
-                p,q = st.columns(2)
+                p, q = st.columns(2)
                 with p:
-                    button_label = "Restore" if row.get("is_archived") else "Archive"
-                    if st.button(button_label, key=f'archive_{row["id"]}'):
+                    label_btn = "Restore" if row.get("is_archived") else "Archive"
+                    if st.button(label_btn, key=f'archive_{row["id"]}'):
                         try:
-                            supabase.table("analysis_history").update({"is_archived":not row.get("is_archived",False)}).eq("id",row["id"]).eq("user_id",uid).execute()
+                            supabase.table("analysis_history").update({"is_archived": not row.get("is_archived", False)}) \
+                                .eq("id", row["id"]).eq("user_id", uid).execute()
                             st.rerun()
                         except Exception as e:
                             st.error(f"Could not update archive status: {e}")
@@ -297,28 +384,29 @@ elif page == "Analysis History":
                     st.warning("This permanently deletes the saved report.")
                     if st.button("Confirm delete", key=f'confirm_{row["id"]}'):
                         try:
-                            supabase.table("analysis_history").delete().eq("id",row["id"]).eq("user_id",uid).execute()
-                            st.session_state.pop(f'confirm_delete_{row["id"]}',None)
+                            supabase.table("analysis_history").delete().eq("id", row["id"]).eq("user_id", uid).execute()
+                            st.session_state.pop(f'confirm_delete_{row["id"]}', None)
                             st.rerun()
                         except Exception as e:
                             st.error(f"Delete failed: {e}")
         if rows:
-            csv_buffer = io.StringIO()
-            writer = csv.DictWriter(csv_buffer, fieldnames=["title","prediction","probability","risk_level","model_used","notes","email_preview","created_at"])
+            buf = io.StringIO()
+            fields = ["title", "prediction", "probability", "risk_level", "model_used", "notes", "email_preview", "created_at"]
+            writer = csv.DictWriter(buf, fieldnames=fields)
             writer.writeheader()
             for row in rows:
-                writer.writerow({k:row.get(k,"") for k in writer.fieldnames})
-            st.download_button("⬇️ Export visible reports as CSV", csv_buffer.getvalue(), "mailshield_history.csv", "text/csv")
+                writer.writerow({k: row.get(k, "") for k in fields})
+            st.download_button("⬇️ Export visible reports as CSV", buf.getvalue(), "mailshield_history.csv", "text/csv")
     except Exception as e:
         st.error(f"Could not load history: {e}")
 
 elif page == "Settings":
     st.subheader("⚙️ Settings & privacy")
-    st.markdown(f"**Account:** {st.session_state.get('user_email','')}")
-    st.info("MailShield stores a short email preview and analysis metadata in your account. It does not save the complete email body to Supabase.")
-    st.markdown("Each user's history is protected by Supabase Row Level Security. Only the signed-in account should be able to access its own records.")
+    st.markdown(f"**Account:** {st.session_state.get('user_email', '')}")
+    st.info("MailShield stores a short email preview and analysis metadata in your account. It does not save the complete email body.")
+    st.markdown("Each user's history is protected by Supabase Row Level Security.")
     if st.button("Log out of MailShield"):
         logout()
 
 st.markdown("---")
-st.caption("MailShield · AI-Based Email Phishing Detection & Risk Assessment · Python · Streamlit · ModernBERT · SVM")
+st.caption("MailShield · AI-Based Email Phishing Detection & Risk Assessment · Python · Streamlit · Logistic Regression · ModernBERT · SVM")
