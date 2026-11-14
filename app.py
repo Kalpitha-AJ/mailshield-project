@@ -29,16 +29,12 @@ def load_svm():
 @st.cache_resource
 def load_modernbert():
 
-    path = "models/modernbert"
+    model_name = "kalpithaaj/mailshield-modernbert"
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        path,
-        local_files_only=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     model = AutoModelForSequenceClassification.from_pretrained(
-        path,
-        local_files_only=True
+        model_name
     )
 
     model.eval()
@@ -256,7 +252,7 @@ if st.button("🔍 Analyse Email", use_container_width=True):
 
             st.write(f"### Risk Level: {risk}")
 
-            # INDICATORS
+            # SUSPICIOUS INDICATORS
 
             st.write("#### 🔎 Suspicious Indicators")
 
@@ -270,9 +266,7 @@ if st.button("🔍 Analyse Email", use_container_width=True):
 
                 st.info("No basic suspicious indicators found.")
 
-            st.caption(
-                "Model: " + selected_model
-            )
+            st.caption("Model: " + selected_model)
 
             st.caption(
                 "Results are model predictions, not a guarantee of email safety. "
